@@ -47,13 +47,16 @@ def embedding_network(state, mask):
 
     # Build graph:
     initial_elems = state
+    
+    activation_fn = tf.nn.relu
 
     # Embedding Part
     for i, block in enumerate(d_e):
         el = initial_elems
         for j, layer in enumerate(block):
             context = c if j==0 and not i==0 else None
-            el = invariant_layer(el, layer, context=context, name='l'+str(i)+'_'+str(j))
+            el = invariant_layer(el, layer, context=context,
+              activation_fn=activation_fn, name='l'+str(i)+'_'+str(j))
 
         c = mask_and_pool(el, mask) # pool to get context for next block
     
