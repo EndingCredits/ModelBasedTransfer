@@ -1,18 +1,21 @@
 from __future__ import division
 
+import os
+
 import numpy as np
 import tensorflow as tf
 import scipy#.misc.imresize
 #import cv2
 
 import knn_dictionary
+from ops import flatten
 
 
 class NECAgent():
     def __init__(self, session, args):
 
         self.full_train = True
-
+        self.use_EWC = False
 
         # Environment details
         self.obs_size = list(args.obs_size)
@@ -89,10 +92,13 @@ class NECAgent():
         with tf.variable_scope('agent_model', reuse=True):
             poststate_embeddings = model(self.post_state)
             
+        self.embedding_weights = tf.get_collection(tf.GraphKeys.VARIABLES,scope='agent_model')    
+
+            
         self.action = tf.placeholder("uint8", [None])
         action_one_hot = tf.one_hot(self.action, self.n_actions, 1.0, 0.0)
         
-        
+        # Forward Model
         self.model_truth = tf.placeholder("float", [None])
         with tf.variable_scope('forward_model'):
             from networks import diff_network
@@ -103,12 +109,30 @@ class NECAgent():
         cross_entropy = self.model_truth * log_pos + (1-self.model_truth) * log_neg
         self.model_loss = -cross_entropy
         
+        self.model_weights = tf.get_collection(tf.GraphKeys.VARIABLES, scope='forward_model')
+        self.flat_model_weights = flatten(self.model_weights)
+        
+        # EWC
+        
+        # Calculations for Elastic Weights
+        log_model_loss = tf.log(self.model_loss)
+        grads = flatten(tf.gradients(log_model_loss, self.model_weights))
+        fisher = tf.square(grads)
+        #fisher = 100 * fisher / tf.reduce_max(fisher) # Max normalise
+        self.EWC_strength = fisher
+        self.running_EWC_stength = np.zeros(self.EWC_strength.get_shape())
+        
+        self.EWC_saved_weights = [np.zeros(self.EWC_strength.get_shape())]
+        self.EWC_saved_strengths = [np.zeros(self.EWC_strength.get_shape())]
+        self.EWC_saved_weights_ph = tf.placeholder("float", [None] + self.EWC_strength.get_shape().as_list())
+        self.EWC_saved_strengths_ph = tf.placeholder("float", [None] + self.EWC_strength.get_shape().as_list())
+        sq_diff = tf.square(self.flat_model_weights - self.EWC_saved_weights_ph)
+        self.EWC_loss = tf.reduce_sum(self.EWC_saved_strengths_ph * sq_diff)
 
         # DNDs
         self.DND = knn_dictionary.q_dictionary(
           self.DND_size, self.state_embeddings.get_shape()[-1], self.n_actions,
           self.dict_delta, self.alpha)
-
 
         # Retrieve info from DND dictionary
         embs_and_values = tf.py_func(self.DND._query,
@@ -127,13 +151,13 @@ class NECAgent():
         # Loss Function
         self.target_q = tf.placeholder("float", [None])
         self.td_err = self.target_q - self.pred_q
-        total_loss = 500 * self.model_loss# + tf.square(self.td_err)
+        total_loss = 100 * self.model_loss # + tf.square(self.td_err)
+        if self.use_EWC:
+          total_loss += 100 * self.EWC_loss
         if self.full_train:
           total_loss += tf.square(self.td_err)
         #total_loss = total_loss + become_skynet_penalty #commenting this out makes code run faster 
         
-        self.embedding_weights = tf.get_collection(tf.GraphKeys.VARIABLES,scope='agent_model')    
-        self.model_weights = tf.get_collection(tf.GraphKeys.VARIABLES, scope='forward_model')
         
         # Optimiser
         if self.full_train:
@@ -149,7 +173,7 @@ class NECAgent():
           
         self.saver = tf.train.Saver(self.embedding_weights)
         self.model_saver = tf.train.Saver(self.model_weights)
-
+        
 
     def _get_state(self, t=-1):
         # Returns the compiled state from stored observations
@@ -214,10 +238,14 @@ class NECAgent():
             self.target_q: Q_targets,
             self.action: actions,
             self.post_state: poststates,
-            self.model_truth: [correct]
+            self.model_truth: [correct],
+            self.EWC_saved_weights_ph: self.EWC_saved_weights,
+            self.EWC_saved_strengths_ph: self.EWC_saved_strengths
         }
 
-        loss, _ = self.session.run([self.model_loss, self.optim], feed_dict=feed_dict)
+        loss, _, stren = self.session.run([self.model_loss, self.optim, self.EWC_strength], feed_dict=feed_dict)
+        
+        self.running_EWC_stength = self.running_EWC_stength*0.99 + stren
         
         self.losses.append(loss)
         
@@ -317,18 +345,30 @@ class NECAgent():
                   self.DND.add(self.trajectory_embeddings, self.trajectory_actions, returns)
         return True
         
+    def EWCSave(self, save_dir, name):
+        numpy_save_vars(self.flat_model_weights, save_dir + '/'+name+'_EWCweights.npy')
+        np.save(save_dir + '/'+name+'_EWCstrength.npy', self.running_EWC_stength)
+        
+    def EWCLoad(self, save_dir, name):
+        weights = numpy_load_vars(save_dir + '/'+name+'_EWCweights.npy')
+        strength = np.load(save_dir + '/'+name+'_EWCstrength.npy')
+        self.EWC_saved_weights.append(weights)
+        self.EWC_saved_stengths.append(strength)
         
     def Save(self, save_dir):
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
         self.saver.save(self.session, save_dir + '/embedding.ckpt')
         self.model_saver.save(self.session, save_dir + '/model.ckpt')
         self.DND.save(save_dir + '/DNDdict')
 
-    def Load(self, save_dir):
+    def Load(self, save_dir, model_only=False):
         #ckpt = tf.train.get_checkpoint_state(save_dir)
-        #print("Loading model from {}".format(ckpt.model_checkpoint_path))
-        #self.saver.restore(self.session, save_dir + '/embedding.ckpt')
+        print("Loading model from {}".format(save_dir))
         self.model_saver.restore(self.session, save_dir + '/model.ckpt')
-        self.DND.load(save_dir + '/DNDdict')
+        if not model_only:
+            self.saver.restore(self.session, save_dir + '/embedding.ckpt')
+            self.DND.load(save_dir + '/DNDdict')
 
 
 def batch_objects(input_list):
@@ -343,6 +383,15 @@ def batch_objects(input_list):
         # Create mask...
         masks.append(np.pad(np.array(np.ones((len(l),1)),dtype=np.float32), ((0,max_len-len(l)),(0,0)), mode='constant'))
     return out, masks
+    
+def numpy_save_vars(tf_var_list, filename):
+    var_list = tf.get_default_session().run(tf_var_list)
+    np.save(filename, var_list)
+    return True
+
+def numpy_load_vars(filename):
+    var_list = np.load(filename)
+    return var_list
 
 
 # Adapted from github.com/devsisters/DQN-tensorflow/

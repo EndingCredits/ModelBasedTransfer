@@ -9,6 +9,8 @@ import tensorflow as tf
 
 import NECAgent
 
+
+
 #TODO: Split this into a separate agent initiation of agent and env and training
 def run_agent(args):
   # Launch the graph
@@ -90,8 +92,7 @@ def run_agent(args):
 
     # Initialize all tensorflow variables
     sess.run(tf.global_variables_initializer())
-
-
+    
     # Keep training until reach max iterations
 
     # Start Agent
@@ -101,6 +102,8 @@ def run_agent(args):
     terminal = False
     
     #agent.Load('chk3')
+    #numpy_save_vars(agent.model_weights, "afile2")
+    #print numpy_load_vars("afile.npy")
     
     for step in tqdm(range(training_iters), ncols=80):
 
@@ -154,7 +157,8 @@ def run_agent(args):
                 +"q: {:4.3f}, avr_ep_r: {:4.1f}, max_ep_r: {:4.1f}, epsilon: {:4.3f}, entries: {}, loss: {:4.3f}"\
                 .format(avr_q, avr_ep_reward, max_ep_reward, agent.epsilon, dict_entries, av_loss))
                 
-            #agent.Save('chk3')
+            agent.Save('chk/'+ args.env)
+            agent.EWCSave('chk/'+ args.env, str(step))
 
     
     # Continue until end of episode
@@ -198,6 +202,8 @@ def test_agent(agent, env):
         agent.Update(action, reward, state, terminal)
         R += reward
     return R
+    
+
 
 if __name__ == '__main__':
 
