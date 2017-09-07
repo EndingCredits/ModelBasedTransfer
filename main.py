@@ -101,9 +101,14 @@ def run_agent(args):
     rewards = []
     terminal = False
     
-    #agent.Load('chk3')
-    #numpy_save_vars(agent.model_weights, "afile2")
-    #print numpy_load_vars("afile.npy")
+    #new_env = 'vgdl_missilecommand_objects-v0'
+    #old_env = 'vgdl_zelda_objects-v0'
+    #agent.Load('chk/'+ new_env, True, False, True)
+    
+    if True:
+        agent.Load('chk', False, True, False)
+        for d in [x[0] for x in os.walk('chk')][1:2]:
+            agent.EWCLoad(d, '_')
     
     for step in tqdm(range(training_iters), ncols=80):
 
@@ -151,14 +156,16 @@ def run_agent(args):
                 avr_q = np.mean(qs[q_last:]) ; q_last = len(qs)
                 ep_reward_last = len(ep_rewards)
             av_loss = np.mean(agent.losses[-1000:])
+            av_EWC_dev = 1000000*np.mean(agent.EWC_L2[-1000:])
             dict_entries = agent.DND.tot_capacity()
             tqdm.write("{}, {:>7}/{}it | {:3n} episodes,"\
                 .format(time.strftime("%H:%M:%S"), step, training_iters, num_eps)
-                +"q: {:4.3f}, avr_ep_r: {:4.1f}, max_ep_r: {:4.1f}, epsilon: {:4.3f}, entries: {}, loss: {:4.3f}"\
-                .format(avr_q, avr_ep_reward, max_ep_reward, agent.epsilon, dict_entries, av_loss))
-                
+                +"q: {:4.3f}, avr_ep_r: {:4.1f}, max_ep_r: {:4.1f}, epsilon: {:4.3f}, entries: {}, loss: {:4.3f}, ewc: {:8.7f}"\
+                .format(avr_q, avr_ep_reward, max_ep_reward, agent.epsilon, dict_entries, av_loss, av_EWC_dev))
+               
             agent.Save('chk/'+ args.env)
-            agent.EWCSave('chk/'+ args.env, str(step))
+            agent.Save('chk', False, True, False)
+            agent.EWCSave('chk/'+ args.env, '_')
 
     
     # Continue until end of episode
@@ -241,7 +248,7 @@ if __name__ == '__main__':
     parser.add_argument('--learn_step', type=int, default=4,
                        help='Number of steps in between learning updates')
 
-    parser.add_argument('--memory_size', type=int, default=500000,
+    parser.add_argument('--memory_size', type=int, default=50000,
                        help='Size of DND dictionary')
     parser.add_argument('--num_neighbours', type=int, default=50,
                        help='Number of nearest neighbours to sample from the DND each time')
