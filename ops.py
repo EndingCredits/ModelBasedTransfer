@@ -4,7 +4,8 @@ from tensorflow.contrib.layers.python.layers import initializers
 
 def linear(x,
            output_size,
-           initializer=tf.truncated_normal_initializer(0.0, 0.02),
+           initializer=tf.truncated_normal_initializer(0, 0.02),
+           #tf.truncated_normal_initializer(0.0, 0.02),
            activation_fn=None,
            name='linear'):
            

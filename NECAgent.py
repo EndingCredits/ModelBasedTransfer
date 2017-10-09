@@ -4,11 +4,10 @@ import os
 
 import numpy as np
 import tensorflow as tf
-import scipy#.misc.imresize
-#import cv2
+import scipy
 
 import knn_dictionary
-from ops import flatten
+from ops import flatten, linear
 
 
 class NECAgent():
@@ -43,6 +42,7 @@ class NECAgent():
         self.memory_size = args.replay_memory_size
         self.batch_size = args.batch_size
         self.learning_rate = args.learning_rate
+        self.model_learning_rate = args.model_learning_rate
         self.learn_step = args.learn_step
 
         # Stored variables
@@ -51,6 +51,7 @@ class NECAgent():
         self.seed = args.seed
         self.rng = np.random.RandomState(self.seed)
         self.losses = []
+        self.visited_states = []
         self.session = session
         
         self.EWC_L2 = []
@@ -74,9 +75,9 @@ class NECAgent():
         # Model for Embeddings
         
         if self.model_type == 'CNN':
-            from networks import deepmind_CNN
+            from networks import CNN
             state_dim = [None, self.history_len] + self.obs_size
-            model = deepmind_CNN
+            model = CNN
         elif self.model_type == 'nn':
             from networks import feedforward_network
             state_dim = [None] + self.obs_size
@@ -89,17 +90,18 @@ class NECAgent():
         self.state = tf.placeholder("float", state_dim)
         self.post_state = tf.placeholder("float", state_dim)
         
+        self.action = tf.placeholder("uint8", [None])
+        action_one_hot = tf.one_hot(self.action, self.n_actions, 1.0, 0.0)
+        
         with tf.variable_scope('agent_model'):
             self.state_embeddings = model(self.state)
+            self.action_embedding = linear(action_one_hot, 8, name='action_embedding')
         with tf.variable_scope('agent_model', reuse=True):
             poststate_embeddings = model(self.post_state)
             
         self.embedding_weights = tf.get_collection(
-            tf.GraphKeys.VARIABLES,scope='agent_model')    
+            tf.GraphKeys.GLOBAL_VARIABLES,scope='agent_model')    
 
-            
-        self.action = tf.placeholder("uint8", [None])
-        action_one_hot = tf.one_hot(self.action, self.n_actions, 1.0, 0.0)
         
         
         # Forward Model
@@ -107,21 +109,21 @@ class NECAgent():
         with tf.variable_scope('forward_model'):
             from networks import diff_network
             self.model_prediction = diff_network(self.state_embeddings,
-                poststate_embeddings, action_one_hot)
+                poststate_embeddings, self.action_embedding)
         log_pos = tf.log(tf.clip_by_value(self.model_prediction, 1e-10, 1.0))
         log_neg = tf.log(tf.clip_by_value(1.0-self.model_prediction,1e-10,1.0))
         cross_entropy = self.model_truth*log_pos + (1-self.model_truth)*log_neg
         self.model_loss = -cross_entropy
         
         self.model_weights = tf.get_collection(
-            tf.GraphKeys.VARIABLES, scope='forward_model')
+            tf.GraphKeys.GLOBAL_VARIABLES, scope='forward_model')
         self.flat_model_weights = flatten(self.model_weights)
         
         
         # EWC
-        
         # Calculations for Elastic Weights
-        log_model_loss = tf.log( tf.clip_by_value(self.model_loss, 1e-10, 1.0) )
+        # change to be based on prediction
+        log_model_loss = tf.log( tf.clip_by_value(self.model_prediction, 1e-10, 1.0) )
         grads = flatten(tf.gradients(log_model_loss, self.model_weights))
         fisher = tf.square(grads)
         #fisher = 100 * fisher / tf.reduce_max(fisher) # Max normalise
@@ -139,16 +141,24 @@ class NECAgent():
             self.flat_model_weights - self.EWC_saved_weights_ph )
         self.EWC_loss = tf.reduce_mean(
             self.EWC_saved_strengths_ph * self.EWC_deviation)
+            
+        if self.use_EWC:
+            self.model_loss += 10 * self.EWC_loss
 
 
         # DNDs
+        # Initial transformation
+        with tf.variable_scope('dnd_embeddings'):
+            self.transformed_embeddings = linear(
+                self.state_embeddings, 128, name='l1' )
+        
         self.DND = knn_dictionary.q_dictionary(
-          self.DND_size, self.state_embeddings.get_shape()[-1], self.n_actions,
-          self.dict_delta, self.alpha)
+          self.DND_size, self.transformed_embeddings.get_shape()[-1],
+          self.n_actions, self.dict_delta, self.alpha)
 
         # Retrieve info from DND dictionary
         embs_and_values = tf.py_func(self.DND._query,
-          [self.state_embeddings, self.action, self.number_nn],
+          [self.transformed_embeddings, self.action, self.number_nn],
           [tf.float64, tf.float64])
         self.dnd_embeddings = tf.to_float(embs_and_values[0])
         self.dnd_values = tf.to_float(embs_and_values[1])
@@ -156,40 +166,44 @@ class NECAgent():
         # DND calculation
         # (takes advantage of broadcasting)
         square_diff = tf.square(
-            self.dnd_embeddings - tf.expand_dims(self.state_embeddings, 1))
+            self.dnd_embeddings - tf.expand_dims(self.transformed_embeddings, 1))
         distances = tf.reduce_sum(square_diff, axis=2) + [self.delta]
         weightings = 1.0 / distances
         norm_weightings = weightings / tf.reduce_sum(weightings, axis=1, keep_dims=True)
         self.pred_q = tf.reduce_sum(self.dnd_values * norm_weightings, axis=1)
         
+        self.dnd_weights = tf.get_collection(
+            tf.GraphKeys.GLOBAL_VARIABLES,scope='dnd_embeddings')
+
         
         # Loss Function
         self.target_q = tf.placeholder("float", [None])
         self.td_err = self.target_q - self.pred_q
-        total_loss = 100 * self.model_loss # + tf.square(self.td_err)
-        if self.use_EWC:
-          total_loss += 1000 * self.EWC_loss
-        if self.full_train:
-          total_loss += tf.square(self.td_err)
+        self.agent_loss = tf.square(self.td_err)
+        
           
         #commenting this out makes code run faster 
         #total_loss = total_loss + become_skynet_penalty 
         
+        #total_loss = total_loss * 0
+        
         
         # Optimiser
+        model_opt = tf.train.AdamOptimizer(self.model_learning_rate)
+        agent_opt = tf.train.AdamOptimizer(self.learning_rate)
+            
         if self.full_train:
-          self.optim = tf.train.AdamOptimizer(
-            self.learning_rate)\
-            .minimize(total_loss)
+          train_op1 = model_opt.minimize(self.model_loss)
+          train_op2 = agent_opt.minimize(self.agent_loss)
+          self.optim = tf.group(train_op1, train_op2)
         else:
-          # These are the optimiser settings used by DeepMind
-          self.optim = tf.train.AdamOptimizer(#, decay=0.9, epsilon=0.01)\
-            self.learning_rate)\
-            .minimize(total_loss, var_list=self.embedding_weights)
+          self.optim = agent_opt.minimize(self.agent_loss, 
+              var_list=self.embedding_weights)
           
         # Savers
         self.saver = tf.train.Saver(self.embedding_weights)
         self.model_saver = tf.train.Saver(self.model_weights)
+        self.dnd_saver = tf.train.Saver(self.dnd_weights)
         
 
     def _get_state(self, t=-1):
@@ -292,6 +306,8 @@ class NECAgent():
         state = self._get_state()
         embedding = self._get_state_embeddings([state])[0]
         
+        self.visited_states.append(embedding)
+        
         # Rendering code for displaying raw state
         if False:
             from gym.envs.classic_control import rendering
@@ -389,6 +405,7 @@ class NECAgent():
         if model:
             self.model_saver.save(self.session, save_dir + '/model.ckpt')
         if DND:
+            self.dnd_saver.save(self.session, save_dir + '/dnd.ckpt')
             self.DND.save(save_dir + '/DNDdict')
 
     def Load(self, save_dir, network=True, model=True, DND=True):
@@ -399,6 +416,7 @@ class NECAgent():
         if model:
             self.model_saver.restore(self.session, save_dir + '/model.ckpt')
         if DND:
+            self.dnd_saver.restore(self.session, save_dir + '/dnd.ckpt')
             self.DND.load(save_dir + '/DNDdict')
 
 
@@ -562,7 +580,7 @@ def default_preprocessor(state):
 
 def greyscale_preprocessor(state):
     #state = cv2.cvtColor(state,cv2.COLOR_BGR2GRAY)/255.
-    state = np.dot(state[...,:3], [0.299, 0.587, 0.114])
+    state = np.dot(state[...,:3], [0.299, 0.587, 0.114])/255
     return state
 
 def deepmind_preprocessor(state):

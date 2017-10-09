@@ -13,6 +13,8 @@ import NECAgent
 
 #TODO: Split this into a separate agent initiation of agent and env and training
 def run_agent(args):
+  training=True
+
   # Launch the graph
   config = tf.ConfigProto()
   config.gpu_options.allow_growth=True
@@ -97,17 +99,25 @@ def run_agent(args):
 
     # Start Agent
     state = env.reset()
-    agent.Reset(state)
+    agent.Reset(state, training)
     rewards = []
     terminal = False
     
-    #new_env = 'vgdl_missilecommand_objects-v0'
-    #old_env = 'vgdl_zelda_objects-v0'
-    #agent.Load('chk/'+ new_env, True, False, True)
+    try:
+        agent.Load('chk/'+ args.env, True, False, True)
+    except:
+        print("Couldn't load agent params.")
+        
+    #other_env = 'vgdl_boulderdash_objects-v0'
+    #agent.Load('chk/'+ args.env, True, False, False)
+    #agent.Load('chk/'+ other_env, False, False, True)
     
     if True:
-        agent.Load('chk', False, True, False)
-        for d in [x[0] for x in os.walk('chk')][1:2]:
+        try:
+            agent.Load('chk', False, True, False)
+        except:
+            print("Couldn't load model")
+        for d in [x[0] for x in os.walk('chk')][1:]:
             agent.EWCLoad(d, '_')
     
     for step in tqdm(range(training_iters), ncols=80):
@@ -144,7 +154,7 @@ def run_agent(args):
 
             # Reset agent and environment
             state = env.reset()
-            agent.Reset(state)
+            agent.Reset(state, training)
 
 
         # Display Statistics
@@ -162,34 +172,45 @@ def run_agent(args):
                 .format(time.strftime("%H:%M:%S"), step, training_iters, num_eps)
                 +"q: {:4.3f}, avr_ep_r: {:4.1f}, max_ep_r: {:4.1f}, epsilon: {:4.3f}, entries: {}, loss: {:4.3f}, ewc: {:8.7f}"\
                 .format(avr_q, avr_ep_reward, max_ep_reward, agent.epsilon, dict_entries, av_loss, av_EWC_dev))
-               
-            agent.Save('chk/'+ args.env)
-            agent.Save('chk', False, True, False)
-            agent.EWCSave('chk/'+ args.env, '_')
+                
+            if training:
+                agent.Save('chk/'+ args.env)
+                agent.Save('chk', False, True, False)
+                agent.EWCSave('chk/'+ args.env, '_')
+            #np.save('chk/'+ args.env + '/states.npy', agent.visited_states)
+                
+                
 
-    
-    # Continue until end of episode
-    step = training_iters
-    while not terminal:
-        # Act, and add 
-        action, value = agent.GetAction()
-        state, reward, terminal, info = env.step(action)
-        agent.Update(action, reward, state, terminal)
-        step += 1
-    
-    # Final test       
-    R_s = []
-    for i in tqdm(range(test_count), ncols=50, bar_format='Testing: |{bar}| {n_fmt}/{total_fmt}'):
-        R = test_agent(agent, env)
-        R_s.append(R)
-    tqdm.write("Tests: {}".format(R_s))
-    tests_done += 1
-    test_results.append({ 'step': step, 'scores': R_s, 'average': np.mean(R_s), 'max': np.max(R_s) })
+    if True:
+        # Continue until end of episode
+        step = training_iters
+        while not terminal:
+            # Act, and add 
+            action, value = agent.GetAction()
+            state, reward, terminal, info = env.step(action)
+            agent.Update(action, reward, state, terminal)
+            step += 1
+            
+    if training:   
+        agent.Save('chk/'+ args.env)
+        agent.Save('chk', False, True, False)
+        agent.EWCSave('chk/'+ args.env, '_')
+    np.save('chk/'+ args.env + '/states.npy', agent.visited_states)
+        
+    if False: 
+        # Final test       
+        R_s = []
+        for i in tqdm(range(test_count), ncols=50, bar_format='Testing: |{bar}| {n_fmt}/{total_fmt}'):
+            R = test_agent(agent, env)
+            R_s.append(R)
+        tqdm.write("Tests: {}".format(R_s))
+        tests_done += 1
+        test_results.append({ 'step': step, 'scores': R_s, 'average': np.mean(R_s), 'max': np.max(R_s) })
 
-    #Save to file
-    summary = { 'params': vars(args), 'tests': test_results }
-    if args.save_file is not None:
-        np.save(args.save_file, summary)
+        #Save to file
+        summary = { 'params': vars(args), 'tests': test_results }
+        if args.save_file is not None:
+            np.save(args.save_file, summary)
                  
 
 def test_agent(agent, env):
@@ -241,6 +262,8 @@ if __name__ == '__main__':
 
     parser.add_argument('--learning_rate', type=float, default=0.00001,
                        help='Learning rate for TD updates')
+    parser.add_argument('--model_learning_rate', type=float, default=0.0025,
+                       help='Learning rate for forward model')
     parser.add_argument('--batch_size', type=int, default=32,
                        help='Size of batch for Q-value updates')
     parser.add_argument('--replay_memory_size', type=int, default=100000,

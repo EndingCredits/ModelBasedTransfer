@@ -1,12 +1,11 @@
 import numpy as np
 import tensorflow as tf
-import ops
 from ops import linear, conv2d, flatten
-from ops import invariant_layer, mask_and_pool
+from ops import invariant_layer, mask_and_pool, get_mask
 
 
 def deepmind_CNN(state, output_size=128):
-    initializer = tf.truncated_normal_initializer(0, 0.1)
+    initializer = tf.truncated_normal_initializer(0, 0.02)
     activation_fn = tf.nn.relu
     
     state = tf.transpose(state, [0, 2, 3, 1])
@@ -22,10 +21,15 @@ def deepmind_CNN(state, output_size=128):
 
     # Returns the network output, parameters
     return embedding
+    
+    
+def CNN(state, n_actions=128):
+    net = deepmind_CNN(state)
+    out = linear(net, n_actions, name='outs')
+    return out
 
 
 def feedforward_network(state, out_size=128):
-    initializer = tf.truncated_normal_initializer(0, 0.1)
     activation_fn = tf.nn.relu
 
     l1 = linear(state, 64,
@@ -42,7 +46,7 @@ def feedforward_network(state, out_size=128):
 
 def embedding_network(state, mask):
     # Placeholder layer sizes
-    d_e = [[128, 256]]
+    d_e = [[64], [64, 128]]#[[128, 256]]
     d_o = [128]
 
     # Build graph:
@@ -63,7 +67,7 @@ def embedding_network(state, mask):
     # Fully connected part
     fc = c
     for i, layer in enumerate(d_o):
-        fc = ops.linear(fc, layer, name='lO_' + str(i))
+        fc = linear(fc, layer, name='lO_' + str(i))
     
     # Output
     embedding = fc
@@ -72,9 +76,9 @@ def embedding_network(state, mask):
     
     
 def object_embedding_network(state, n_actions=128):
-    mask = ops.get_mask(state)
+    mask = get_mask(state)
     net = embedding_network(state, mask)
-    out = ops.linear(net, n_actions, name='outs')
+    out = linear(net, n_actions, name='outs')
     return out
 
     
