@@ -1,6 +1,7 @@
 from __future__ import division
 
 import os
+from collections import deque
 
 import numpy as np
 import tensorflow as tf
@@ -14,7 +15,7 @@ class NECAgent():
     def __init__(self, session, args):
 
         self.full_train = True
-        self.use_EWC = True
+        self.use_EWC = False
 
         # Environment details
         self.obs_size = list(args.obs_size)
@@ -46,12 +47,17 @@ class NECAgent():
         self.learn_step = args.learn_step
 
         # Stored variables
+        self.name = args.env
         self.step = 0
         self.started_training = False
         self.seed = args.seed
         self.rng = np.random.RandomState(self.seed)
         self.losses = []
-        self.visited_states = []
+        self.discrim_losses = []
+        self.gen_losses = []
+        self.ep_reward = 0
+        self.ep_rewards = []
+        self.visited_states = deque([], maxlen=20000)
         self.session = session
         
         self.EWC_L2 = []
@@ -71,6 +77,8 @@ class NECAgent():
         
 
         # Tensorflow variables:
+        
+        
         
         # Model for Embeddings
         
@@ -93,23 +101,31 @@ class NECAgent():
         self.action = tf.placeholder("uint8", [None])
         action_one_hot = tf.one_hot(self.action, self.n_actions, 1.0, 0.0)
         
-        with tf.variable_scope('agent_model'):
+        with tf.variable_scope(self.name + '_agent_model'):
             self.state_embeddings = model(self.state)
-            self.action_embedding = linear(action_one_hot, 8, name='action_embedding')
-        with tf.variable_scope('agent_model', reuse=True):
+            self.action_embedding = tf.nn.tanh(
+                linear(action_one_hot, 64, name='action_embedding'))
+        with tf.variable_scope(self.name + '_agent_model', reuse=True):
             poststate_embeddings = model(self.post_state)
             
         self.embedding_weights = tf.get_collection(
-            tf.GraphKeys.GLOBAL_VARIABLES,scope='agent_model')    
+            tf.GraphKeys.GLOBAL_VARIABLES, scope=self.name+'_agent_model')    
 
+        
         
         
         # Forward Model
         self.model_truth = tf.placeholder("float", [None])
-        with tf.variable_scope('forward_model'):
-            from networks import diff_network
-            self.model_prediction = diff_network(self.state_embeddings,
-                poststate_embeddings, self.action_embedding)
+        from networks import diff_network
+        try:
+            with tf.variable_scope('forward_model'):
+                self.model_prediction = diff_network(self.state_embeddings,
+                    poststate_embeddings, self.action_embedding)
+        except ValueError:
+            with tf.variable_scope('forward_model', reuse=True):
+                self.model_prediction = diff_network(self.state_embeddings,
+                    poststate_embeddings, self.action_embedding)
+                    
         log_pos = tf.log(tf.clip_by_value(self.model_prediction, 1e-10, 1.0))
         log_neg = tf.log(tf.clip_by_value(1.0-self.model_prediction,1e-10,1.0))
         cross_entropy = self.model_truth*log_pos + (1-self.model_truth)*log_neg
@@ -119,6 +135,42 @@ class NECAgent():
             tf.GraphKeys.GLOBAL_VARIABLES, scope='forward_model')
         self.flat_model_weights = flatten(self.model_weights)
         
+        #for w in self.model_weights:
+        #    print w
+        #print " "
+        
+        
+        
+        
+        # Discriminator
+        self.discrim_truth = tf.placeholder("float", 1)
+        #self.discrim_fake = tf.placeholder("float", self.state_embeddings.get_shape())
+        emb = self.state_embeddings #tf.cond(self.discrim_truth == 1, 
+            #lambda: self.state_embeddings, lambda: self.discrim_fake)
+        from networks import discrim_network
+        with tf.variable_scope(self.name + '_discriminator'):
+            self.discrim_prediction = discrim_network(emb)
+        log_pos = tf.log(tf.clip_by_value(self.discrim_prediction, 1e-10, 1.0))
+        log_neg = tf.log(tf.clip_by_value(1.0-self.discrim_prediction, 1e-10,1.0))
+        
+        if False:
+            wass_loss = (1-self.discrim_truth) * self.discrim_prediction - \
+             (self.discrim_truth) * self.discrim_prediction
+            self.discrim_loss = wass_loss
+            self.gen_loss = self.discrim_prediction
+        elif False:
+            self.discrim_loss = (1-self.discrim_truth)*((1-self.discrim_prediction)**2) + \
+             self.discrim_truth*(self.discrim_prediction**2)
+            self.gen_loss = (1-self.discrim_prediction)**2
+        else:
+            cross_entropy = (1-self.discrim_truth)*log_pos + (self.discrim_truth)*log_neg
+            self.discrim_loss = -cross_entropy
+            self.gen_loss = -log_pos
+        
+        self.discrim_weights = tf.get_collection(
+            tf.GraphKeys.GLOBAL_VARIABLES, scope=self.name+'_discriminator')
+            
+            
         
         # EWC
         # Calculations for Elastic Weights
@@ -129,7 +181,7 @@ class NECAgent():
         #fisher = 100 * fisher / tf.reduce_max(fisher) # Max normalise
         self.EWC_strength = fisher
         self.running_EWC_strength = np.zeros(self.EWC_strength.get_shape())
-        
+
         self.EWC_saved_empty = True
         self.EWC_saved_weights = [np.zeros(self.EWC_strength.get_shape())]
         self.EWC_saved_strengths = [np.zeros(self.EWC_strength.get_shape())]
@@ -141,14 +193,14 @@ class NECAgent():
             self.flat_model_weights - self.EWC_saved_weights_ph )
         self.EWC_loss = tf.reduce_mean(
             self.EWC_saved_strengths_ph * self.EWC_deviation)
-            
+                
         if self.use_EWC:
             self.model_loss += 10 * self.EWC_loss
 
 
         # DNDs
         # Initial transformation
-        with tf.variable_scope('dnd_embeddings'):
+        with tf.variable_scope(self.name + '_dnd_embeddings'):
             self.transformed_embeddings = linear(
                 self.state_embeddings, 128, name='l1' )
         
@@ -173,7 +225,7 @@ class NECAgent():
         self.pred_q = tf.reduce_sum(self.dnd_values * norm_weightings, axis=1)
         
         self.dnd_weights = tf.get_collection(
-            tf.GraphKeys.GLOBAL_VARIABLES,scope='dnd_embeddings')
+            tf.GraphKeys.GLOBAL_VARIABLES, scope=self.name+'_dnd_embeddings')
 
         
         # Loss Function
@@ -181,24 +233,44 @@ class NECAgent():
         self.td_err = self.target_q - self.pred_q
         self.agent_loss = tf.square(self.td_err)
         
-          
         #commenting this out makes code run faster 
         #total_loss = total_loss + become_skynet_penalty 
-        
-        #total_loss = total_loss * 0
-        
-        
+
         # Optimiser
-        model_opt = tf.train.AdamOptimizer(self.model_learning_rate)
-        agent_opt = tf.train.AdamOptimizer(self.learning_rate)
+        with tf.variable_scope(self.name + "_optim"):
+          if True:
+            from adamirror import AdamirrorOptimizer
+            model_opt = AdamirrorOptimizer(self.model_learning_rate)
+            agent_opt = tf.train.RMSPropOptimizer(self.learning_rate)
+            discrim_opt = AdamirrorOptimizer(self.model_learning_rate)
+          else:
+            model_opt = tf.train.RMSPropOptimizer(self.model_learning_rate)
+            agent_opt = tf.train.RMSPropOptimizer(self.learning_rate)
+            discrim_opt = tf.train.RMSPropOptimizer(self.model_learning_rate)
+          #agent_opt = tf.train.GradientDescentOptimizer(self.learning_rate)
+        
+          if self.full_train:
+            reg = self.state_embeddings * self.state_embeddings
+            grads = tf.gradients(self.model_loss + 0.1*self.gen_loss + 0.01*reg,
+                self.embedding_weights + self.model_weights)
+            grads1 = grads[:len(self.embedding_weights)]
+            grads2 = grads[len(self.embedding_weights):]
+            train_op1 = model_opt.apply_gradients(
+                zip(grads1, self.embedding_weights))
+            train_op2 = agent_opt.apply_gradients(
+                zip(grads2, self.model_weights))
+            self.optim = tf.group(train_op1, train_op2)
             
-        if self.full_train:
-          train_op1 = model_opt.minimize(self.model_loss)
-          train_op2 = agent_opt.minimize(self.agent_loss)
-          self.optim = tf.group(train_op1, train_op2)
-        else:
-          self.optim = agent_opt.minimize(self.agent_loss, 
-              var_list=self.embedding_weights)
+            self.optim2 = discrim_opt.minimize(self.discrim_loss,
+                var_list=self.discrim_weights)
+            
+            #train_op1 = model_opt.minimize(self.model_loss)
+            #train_op2 = agent_opt.minimize(self.agent_loss+1000*self.model_loss)
+            #self.optim = train_op2#tf.group(train_op1, train_op2)
+            
+          else:
+            self.optim = agent_opt.minimize(self.model_loss, 
+                var_list=self.embedding_weights)
           
         # Savers
         self.saver = tf.train.Saver(self.embedding_weights)
@@ -232,7 +304,8 @@ class NECAgent():
             embeddings = self.session.run(self.state_embeddings,
               feed_dict={self.state: states_})#, self.masks: masks})
         else:    
-            embeddings = self.session.run(self.state_embeddings, feed_dict={self.state: states})
+            embeddings = self.session.run(self.state_embeddings,
+              feed_dict={self.state: states})
         return embeddings
 
 
@@ -270,11 +343,14 @@ class NECAgent():
             self.action: actions,
             self.post_state: poststates,
             self.model_truth: [correct],
+            self.discrim_truth: [1.0],
             self.EWC_saved_weights_ph: self.EWC_saved_weights,
             self.EWC_saved_strengths_ph: self.EWC_saved_strengths
         }
 
-        loss, _, stren, dev = self.session.run([self.model_loss, self.optim, self.EWC_strength, self.EWC_deviation], feed_dict=feed_dict)
+        loss, loss_g, _, stren, dev = self.session.run(
+          [self.model_loss, self.gen_loss, self.optim, self.EWC_strength, self.EWC_deviation],
+          feed_dict=feed_dict)
         
         self.running_EWC_strength = self.running_EWC_strength*0.99 + stren
         #print stren
@@ -282,9 +358,29 @@ class NECAgent():
         #print str(np.mean(self.running_EWC_strength)) + ', ' + str(np.max(self.running_EWC_strength))
         
         self.losses.append(loss)
+        self.gen_losses.append(np.mean(loss_g))
         self.EWC_L2.append(np.mean(dev))
         
-        return True
+        #assign_op = [var.assign(tf.clip_by_value(var, -0.01, 0.01)) for var in self.discrim_weights]
+        #self.session.run(assign_op)
+        #self.clip_D = [p.assign(tf.clip_by_value(p, -0.01, 0.01)) for p in self.discrim_weights]
+        
+        
+    def _train_discrim(self, embeddings, truth):
+    
+        feed_dict = {
+            #self.discrim_fake: embeddings,
+            self.state_embeddings: embeddings,
+            self.discrim_truth: [truth]
+        }
+
+        loss_d, _ = self.session.run(
+          [self.discrim_loss, self.optim2], feed_dict=feed_dict)
+          
+        self.discrim_losses.append(np.mean(loss_d))
+        
+        return loss_d
+        
 
 
     def Reset(self, obs, train=True):
@@ -305,8 +401,10 @@ class NECAgent():
         # Get state embedding of last stored state
         state = self._get_state()
         embedding = self._get_state_embeddings([state])[0]
-        
+
         self.visited_states.append(embedding)
+        
+        #self.visited_states = self.visited_states[-20000:]
         
         # Rendering code for displaying raw state
         if False:
@@ -342,6 +440,11 @@ class NECAgent():
         self.trajectory_observations.append(self.preproc(obs))
 
         self.step += 1
+        self.ep_reward += reward
+        
+        if terminal:
+            self.ep_rewards.append(self.ep_reward)
+            self.ep_reward = 0
 
         if self.training:
 
@@ -355,7 +458,7 @@ class NECAgent():
                 threshold = 0.5
                 c=1.0
                 if np.random.rand() > threshold:
-                    p, _, _, _ = self.memory.sample(self.batch_size, self.history_len)
+                    _, _, _, p = self.memory.sample(self.batch_size, self.history_len)
                     c=0.0
                 # Run optimization op (backprop)
                 self._train(s, a, R, p, c)
@@ -376,11 +479,16 @@ class NECAgent():
                         
                     for i in xrange(start_t-1, t, -1):
                         R_t = R_t * self.discount + self.trajectory_rewards[i]
+                        
                     returns.append(R_t)
-                    self.memory.add(self.trajectory_observations[t], self.trajectory_actions[t], R_t, (t==(self.trajectory_t-1)))
+                    self.memory.add(self.trajectory_observations[t],
+                                    self.trajectory_actions[t],
+                                    R_t,
+                                    (t==(self.trajectory_t-1)))
                 if self.full_train:
-                  self.DND.add(self.trajectory_embeddings, self.trajectory_actions, returns)
-        return True
+                    self.DND.add(self.trajectory_embeddings,
+                                 self.trajectory_actions,
+                                 returns)
         
     def EWCSave(self, save_dir, name):
         numpy_save_vars(self.flat_model_weights, save_dir + '/'+name+'_EWCweights.npy')
@@ -433,6 +541,7 @@ def batch_objects(input_list):
         masks.append(np.pad(np.array(np.ones((len(l),1)),dtype=np.float32), ((0,max_len-len(l)),(0,0)), mode='constant'))
     return out, masks
     
+    
 def numpy_save_vars(tf_var_list, filename):
     var_list = tf.get_default_session().run(tf_var_list)
     np.save(filename, var_list)
@@ -441,6 +550,11 @@ def numpy_save_vars(tf_var_list, filename):
 def numpy_load_vars(filename):
     var_list = np.load(filename)
     return var_list
+
+
+
+
+
 
 
 # Adapted from github.com/devsisters/DQN-tensorflow/
@@ -513,65 +627,8 @@ class ReplayMemory:
     return states, self.actions[indexes], self.returns[indexes], poststates
 
 
-class trajectory:
-# Get_Action requires last 4 obs to make a prediction
-# Observations need to be stored to make prediction
-# Actions and rewards need to be stored to calculate returns
-# Values can be stored to prevent need from computing them twice
-# Embeddings can be stored to prevent need from computing them twice (only needed for NEC)
-    def __init__(self, obs_size):
-        self.obs_size = obs_size
-
-        self.trajectory = []
-        self.current_entry = trajectory_entry()
-        self.t = 0
-
-        self.trajectory_observations = [obs]
-        self.trajectory_embeddings = []
-        self.trajectory_values = []
-        self.trajectory_actions = []
-        self.trajectory_rewards = []
-
-    def _get_entry(self, t):
-        if t==-1 or t==self.t: return self.current_entry
-        return self.trajectory[t]
-
-    def step(self):
-        self.trajectory.append(self.current_entry)
-        self.current_entry = trajectory_entry()
-        self.t += 1
-
-    def get_state(self, t=-1, his_len=1):
-        if t==-1: t = self.t
-
-        state = np.zeros([self.history_len]+self.obs_size)
-        for i in range(his_len):
-            state[i] = self._get_entry(t-i).observation
-        return state
-
-    def get_returns(self, n_step):
-
-        for t in xrange(self.trajectory_t):
-            if self.trajectory_t - t > self.n_steps:
-                #Get truncated return
-                start_t = t + self.n_steps
-                R_t = self.trajectory_values[start_t]
-            else:
-                start_t = self.trajectory_t 
-                R_t = 0
-                        
-            for i in xrange(start_t-1, t, -1):
-                R_t = R_t * self.discount + self.trajectory_rewards[i]
-
-        return obs, embeddings, actions, returns
 
 
-class trajectory_entry:
-  observation = None
-  embedding = None
-  action = None
-  reward = None
-  value = None
 
 
 # Preprocessors:
@@ -580,7 +637,7 @@ def default_preprocessor(state):
 
 def greyscale_preprocessor(state):
     #state = cv2.cvtColor(state,cv2.COLOR_BGR2GRAY)/255.
-    state = np.dot(state[...,:3], [0.299, 0.587, 0.114])/255
+    state = np.dot(state[...,:3], [0.299, 0.587, 0.114])#/255
     return state
 
 def deepmind_preprocessor(state):

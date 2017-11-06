@@ -5,7 +5,8 @@ from ops import invariant_layer, mask_and_pool, get_mask
 
 
 def deepmind_CNN(state, output_size=128):
-    initializer = tf.truncated_normal_initializer(0, 0.02)
+    initializer = tf.contrib.layers.xavier_initializer()
+    #tf.truncated_normal_initializer(0, 0.1)
     activation_fn = tf.nn.relu
     
     state = tf.transpose(state, [0, 2, 3, 1])
@@ -26,6 +27,8 @@ def deepmind_CNN(state, output_size=128):
 def CNN(state, n_actions=128):
     net = deepmind_CNN(state)
     out = linear(net, n_actions, name='outs')
+    #out = tf.nn.l2_normalize(out, dim=1)
+
     return out
 
 
@@ -85,19 +88,36 @@ def object_embedding_network(state, n_actions=128):
 def diff_network(state_a, state_b, action):
     activation_fn = tf.nn.relu
     with tf.variable_scope('difference_network'):
-
-        a = linear(state_a, 256,
+    
+        a = linear(state_a, 128,
           activation_fn=activation_fn, name='a')
           
-        b = linear(state_b, 256,
+        b = linear(state_b, 128,
           activation_fn=activation_fn, name='b')
         
-        cont = a - b #state_a - state_b # a - b
+        #cont = state_a - state_b + a - b
+        cont = tf.concat([a, b], -1)
         
-        l1 = linear(cont, 256,
-          activation_fn=activation_fn, name='hidden') + linear(action, 256,
-          activation_fn=activation_fn, name='hidden_b')
-        out = linear(l1, 1, name='out')
+        l1 = linear(cont, 256, activation_fn=activation_fn, name='hidden')\
+          + linear(action, 256, activation_fn=activation_fn, name='hidden_b')
+        l2 = linear(l1, 256,
+          activation_fn=activation_fn, name='hidden_l2')
+        out = linear(l2, 1, name='out')
+        out = tf.nn.sigmoid(out)
+        
+    return out
+    
+    
+def discrim_network(state, num_outputs=1):
+    activation_fn = tf.nn.relu
+    with tf.variable_scope('discriminator_network'):
+        l1 = linear(state, 256,
+          activation_fn=activation_fn, name='hidden')
+        l2 = linear(l1, 256,
+          activation_fn=activation_fn, name='hidden_l2')
+        l3 = linear(l2, 256,
+          activation_fn=activation_fn, name='hidden_l3')
+        out = linear(l3, 1, name='out')
         out = tf.nn.sigmoid(out)
         
     return out

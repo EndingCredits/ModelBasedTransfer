@@ -4,7 +4,7 @@ from tensorflow.contrib.layers.python.layers import initializers
 
 def linear(x,
            output_size,
-           initializer=tf.truncated_normal_initializer(0, 0.02),
+           initializer=tf.contrib.layers.xavier_initializer(),
            #tf.truncated_normal_initializer(0.0, 0.02),
            activation_fn=None,
            name='linear'):
@@ -91,7 +91,7 @@ def invariant_layer(x,
 def get_mask(x):
     # Returns a matrix with values set to 1 where elements aren't padding
     emb_sum = tf.reduce_sum(tf.abs(x), axis=-1, keep_dims=True)
-    return 0.99 - tf.to_float(tf.equal(emb_sum, 0.0))
+    return 1.0 - tf.to_float(tf.equal(emb_sum, 0.0))
 
 
 def mask_and_pool(embeds, mask, pool_type='max'):
